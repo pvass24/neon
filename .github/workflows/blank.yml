@@ -1,11 +1,12 @@
 name: Create Neon Twin
+
 on:
   schedule:
     - cron: '0 0 * * *' # Runs every day at midnight
   workflow_dispatch: # Allows manual trigger
   push:
-   branches:
-    - main
+    branches:
+      - main
 
 permissions:
   id-token: write
@@ -43,19 +44,31 @@ jobs:
           pg_dump --version
           pg_restore --version
 
+      - name: Debug Connection String
+        env:
+          PROD_DATABASE_URL: ${{ secrets.PROD_DATABASE_URL }}
+        run: |
+          echo "Connection string: ${PROD_DATABASE_URL}" | sed 's/:.*@/:***@/'
+
+      - name: Test RDS Connection
+        env:
+          PROD_DATABASE_URL: ${{ secrets.PROD_DATABASE_URL }}
+        run: |
+          psql "${PROD_DATABASE_URL}" -c '\l'
+
       - name: Dump from RDS
         env:
           PROD_DATABASE_URL: ${{ secrets.PROD_DATABASE_URL }}
         run: |
           echo "Dumping data from RDS to file..."
-          /usr/lib/postgresql/${{ env.PG_VERSION }}/bin/pg_dump "${PROD_DATABASE_URL}" -Fc -f "${{ github.workspace }}/prod-dump-file.dump"
+          pg_dump "${PROD_DATABASE_URL}" -Fc -f "${{ github.workspace }}/prod-dump-file.dump"
 
       - name: Restore to Neon
         env:
           DEV_DATABASE_URL: ${{ secrets.DEV_DATABASE_URL }}
         run: |
           echo "Restoring data to Neon..."
-          /usr/lib/postgresql/${{ env.PG_VERSION }}/bin/pg_restore -d "${DEV_DATABASE_URL}" --clean --no-owner --no-acl --if-exists "${{ github.workspace }}/prod-dump-file.dump"
+          pg_restore -d "${DEV_DATABASE_URL}" --clean --no-owner --no-acl --if-exists "${{ github.workspace }}/prod-dump-file.dump"
 
       - name: Cleanup
         run: |

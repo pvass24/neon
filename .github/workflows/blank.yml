@@ -1,0 +1,47 @@
+name: Neon Twin RDS Workflow
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  access-rds:
+    name: Access RDS Instance
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v3
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/GitHub_Actions_Role_${{ secrets.CLOUDFORMATION_STACK_NAME }}
+          aws-region: us-west-2
+
+      - name: Retrieve RDS Connection Info from SSM
+        id: ssm
+        run: |
+          ENDPOINT=$(aws ssm get-parameter --name /rds/db-endpoint --query 'Parameter.Value' --output text)
+          USERNAME=$(aws ssm get-parameter --name /rds/db-username --query 'Parameter.Value' --output text)
+          PASSWORD=$(aws ssm get-parameter --name /rds/db-password --query 'Parameter.Value' --output text)
+          echo "RDS_ENDPOINT=${ENDPOINT}" >> $GITHUB_ENV
+          echo "RDS_USERNAME=${USERNAME}" >> $GITHUB_ENV
+          echo "RDS_PASSWORD=${PASSWORD}" >> $GITHUB_ENV
+
+      - name: Verify RDS Connection
+        run: |
+          echo "Connecting to RDS instance at $RDS_ENDPOINT"
+          psql "host=$RDS_ENDPOINT user=$RDS_USERNAME password=$RDS_PASSWORD dbname=employees" -c '\conninfo'
+
+      - name: Execute Query on RDS
+        run: |
+          QUERY="SELECT COUNT(*) FROM employee;"
+          echo "Executing query: $QUERY"
+          psql "host=$RDS_ENDPOINT user=$RDS_USERNAME password=$RDS_PASSWORD dbname=employees" -c "$QUERY"

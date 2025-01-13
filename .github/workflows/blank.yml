@@ -30,7 +30,7 @@ jobs:
         run: |
           # Example AWS CLI commands
           echo "Describing RDS instances for verification..."
-          aws rds describe-db-instances --query "DBInstances[].DBInstanceIdentifier"
+          aws rds describe-db-instances --query "DBInstances[].DBInstanceIdentifier" --region=us-west-2
 
           echo "Connecting to the target RDS database to ensure access works..."
           export DB_USERNAME=postgres

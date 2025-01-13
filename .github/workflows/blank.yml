@@ -3,6 +3,9 @@ on:
   schedule:
     - cron: '0 0 * * *' # Runs every day at midnight
   workflow_dispatch: # Allows manual trigger
+  push:
+   branches:
+    - main
 
 permissions:
   id-token: write

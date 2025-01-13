@@ -1,47 +1,41 @@
-name: Neon Twin RDS Workflow
+name: Deploy to AWS via OIDC
 
 on:
   push:
     branches:
       - main
-  workflow_dispatch:
 
 permissions:
   id-token: write
   contents: read
 
 jobs:
-  access-rds:
-    name: Access RDS Instance
+  deploy:
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
 
-      - name: Configure AWS Credentials
+      - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v3
         with:
-          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/GitHub_Actions_Role_${{ secrets.CLOUDFORMATION_STACK_NAME }}
+          role-to-assume: ${{ secrets.AWS_ACCOUNT_ROLE }}
           aws-region: us-west-2
 
-      - name: Retrieve RDS Connection Info from SSM
-        id: ssm
-        run: |
-          ENDPOINT=$(aws ssm get-parameter --name /rds/db-endpoint --query 'Parameter.Value' --output text)
-          USERNAME=$(aws ssm get-parameter --name /rds/db-username --query 'Parameter.Value' --output text)
-          PASSWORD=$(aws ssm get-parameter --name /rds/db-password --query 'Parameter.Value' --output text)
-          echo "RDS_ENDPOINT=${ENDPOINT}" >> $GITHUB_ENV
-          echo "RDS_USERNAME=${USERNAME}" >> $GITHUB_ENV
-          echo "RDS_PASSWORD=${PASSWORD}" >> $GITHUB_ENV
+      - name: Verify AWS Identity
+        run: aws sts get-caller-identity
 
-      - name: Verify RDS Connection
+      - name: Deploy to RDS
         run: |
-          echo "Connecting to RDS instance at $RDS_ENDPOINT"
-          psql "host=$RDS_ENDPOINT user=$RDS_USERNAME password=$RDS_PASSWORD dbname=employees" -c '\conninfo'
+          # Example AWS CLI commands
+          echo "Describing RDS instances for verification..."
+          aws rds describe-db-instances --query "DBInstances[].DBInstanceIdentifier"
 
-      - name: Execute Query on RDS
-        run: |
-          QUERY="SELECT COUNT(*) FROM employee;"
-          echo "Executing query: $QUERY"
-          psql "host=$RDS_ENDPOINT user=$RDS_USERNAME password=$RDS_PASSWORD dbname=employees" -c "$QUERY"
+          echo "Connecting to the target RDS database to ensure access works..."
+          export DB_USERNAME=postgres
+          export DB_PASSWORD=ilovene0n
+          export DB_ENDPOINT=$(aws ssm get-parameter --name /rds/db-endpoint --query 'Parameter.Value' --output text)
+
+          echo "Database Endpoint: $DB_ENDPOINT"
+          psql "host=$DB_ENDPOINT user=$DB_USERNAME password=$DB_PASSWORD dbname=employees" -c '\dt'

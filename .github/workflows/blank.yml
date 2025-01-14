@@ -54,23 +54,36 @@ jobs:
           pg_dump --version
           pg_restore --version
 
-      - name: Start Port Forwarding
+      - name: Parse DB URL and Start Port Forwarding
         run: |
-          # Extract host from PROD_DATABASE_URL
-          RDS_HOST=$(echo $PROD_DATABASE_URL | sed -n 's/.*@\([^:]*\).*/\1/p')
+          # Parse the PROD_DATABASE_URL
+          DB_HOST=$(echo $PROD_DATABASE_URL | sed -n 's/.*@\([^:]*\).*/\1/p')
+          DB_USER=$(echo $PROD_DATABASE_URL | sed -n 's/.*:\/\/\([^:]*\):.*/\1/p')
+          DB_PASS=$(echo $PROD_DATABASE_URL | sed -n 's/.*:\/\/[^:]*:\([^@]*\).*/\1/p')
+          DB_NAME=$(echo $PROD_DATABASE_URL | sed -n 's/.*\/\(.*\)/\1/p')
+          
+          echo "DB_HOST=$DB_HOST" >> $GITHUB_ENV
+          echo "DB_USER=$DB_USER" >> $GITHUB_ENV
+          echo "DB_PASS=$DB_PASS" >> $GITHUB_ENV
+          echo "DB_NAME=$DB_NAME" >> $GITHUB_ENV
+          
           # Start SSM session and port forwarding in the background
           nohup aws ssm start-session \
             --target ${{ env.EC2_INSTANCE_ID }} \
             --document-name AWS-StartPortForwardingSessionToRemoteHost \
-            --parameters "{\"host\":[\"$RDS_HOST\"],\"portNumber\":[\"5432\"], \"localPortNumber\":[\"15432\"]}" &
+            --parameters "{\"host\":[\"$DB_HOST\"],\"portNumber\":[\"5432\"], \"localPortNumber\":[\"15432\"]}" &
+          
           # Wait for port forwarding to be established
           sleep 10
 
       - name: Dump from RDS
         run: |
           echo "Dumping data from RDS to file..."
-          /usr/lib/postgresql/${{ env.PG_VERSION }}/bin/pg_dump \
-            -d "${PROD_DATABASE_URL//@*:/@localhost:15432/}" \
+          PGPASSWORD=${{ env.DB_PASS }} /usr/lib/postgresql/${{ env.PG_VERSION }}/bin/pg_dump \
+            -h localhost \
+            -p 15432 \
+            -U ${{ env.DB_USER }} \
+            -d ${{ env.DB_NAME }} \
             -Fc -f "${{ github.workspace }}/prod-dump-file.dump"
 
       - name: Restore to Neon

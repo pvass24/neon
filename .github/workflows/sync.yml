@@ -33,10 +33,22 @@ jobs:
        
      - name: Get EC2 Instance ID
        run: |
+         # First, let's see all instances with their tags
+         echo "Checking all instances with VSCodeServer tag..."
+         aws ec2 describe-instances \
+           --filters "Name=tag:Name,Values=VSCodeServer" \
+           --query 'Reservations[*].Instances[*].[InstanceId,Tags[*]]' \
+           --output json
+         
+         # Now let's get our specific instance ID
          EC2_INSTANCE_ID=$(aws ec2 describe-instances \
-           --filters "Name=tag:Name,Values=VSCodeServer" "Name=instance-state-name,Values=running" \
+           --filters "Name=tag:Name,Values=VSCodeServer" \
+                     "Name=instance-state-name,Values=running" \
+                     "Name=tag:aws:cloudformation:stack-name,Values=vscode-server" \
            --query "Reservations[0].Instances[0].InstanceId" \
            --output text)
+         
+         echo "Found EC2 Instance ID: $EC2_INSTANCE_ID"
          echo "EC2_INSTANCE_ID=$EC2_INSTANCE_ID" >> $GITHUB_ENV
 
      - name: Install Session Manager Plugin

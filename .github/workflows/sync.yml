@@ -78,50 +78,34 @@ jobs:
          pg_dump --version
          pg_restore --version
 
-     - name: Parse DB URL and Start Port Forwarding
+     - name: Get DB Parameters and Start Port Forwarding
        run: |
-         # Parse the PROD_DATABASE_URL
-         DB_HOST=$(echo $PROD_DATABASE_URL | sed -n 's/.*@\([^:]*\).*/\1/p')
-         DB_USER=$(echo $PROD_DATABASE_URL | sed -n 's/.*:\/\/\([^:]*\):.*/\1/p')
-         DB_PASS=$(echo $PROD_DATABASE_URL | sed -n 's/.*:\/\/[^:]*:\([^@]*\).*/\1/p')
-         DB_NAME=$(echo $PROD_DATABASE_URL | sed -n 's/.*\/\(.*\)/\1/p')
+         # Get values from SSM Parameters
+         DB_HOST=$(aws ssm get-parameter --name "/rds/db-endpoint" --query "Parameter.Value" --output text)
+         DB_USER=$(aws ssm get-parameter --name "/rds/db-username" --query "Parameter.Value" --output text)
+         DB_PASS=$(aws ssm get-parameter --name "/rds/db-password" --query "Parameter.Value" --output text)
          
          echo "DB_HOST=$DB_HOST" >> $GITHUB_ENV
          echo "DB_USER=$DB_USER" >> $GITHUB_ENV
          echo "DB_PASS=$DB_PASS" >> $GITHUB_ENV
-         echo "DB_NAME=$DB_NAME" >> $GITHUB_ENV
+         echo "DB_NAME=employees" >> $GITHUB_ENV
          
          # Start SSM session with explicit output to verify
+         echo "Starting SSM session with host: $DB_HOST"
          aws ssm start-session \
            --target ${{ env.EC2_INSTANCE_ID }} \
            --document-name AWS-StartPortForwardingSessionToRemoteHost \
            --parameters "{\"host\":[\"$DB_HOST\"],\"portNumber\":[\"5432\"], \"localPortNumber\":[\"15432\"]}" > ssm_output.log 2>&1 &
          
-         # Store the SSM process ID
-         SSM_PID=$!
-         echo "SSM_PID=$SSM_PID" >> $GITHUB_ENV
-         
          # Wait for port forwarding to be established and test the connection
-         echo "Waiting for port forwarding to be established..."
-         attempt=1
-         max_attempts=30
-         
-         until nc -z localhost 15432 || [ $attempt -gt $max_attempts ]
-         do
-           echo "Attempt $attempt of $max_attempts"
-           cat ssm_output.log
-           sleep 5
-           attempt=$((attempt + 1))
+         for i in {1..30}; do
+           if nc -zv localhost 15432 >/dev/null 2>&1; then
+             echo "Port forwarding established"
+             break
+           fi
+           echo "Waiting for port forwarding... ($i/30)"
+           sleep 2
          done
-         
-         if [ $attempt -gt $max_attempts ]; then
-           echo "Failed to establish port forwarding"
-           cat ssm_output.log
-           exit 1
-         fi
-         
-         echo "Port forwarding successfully established"
-         ps aux | grep ssm
 
      - name: Dump from RDS
        run: |

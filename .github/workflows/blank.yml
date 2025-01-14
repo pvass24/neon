@@ -1,12 +1,8 @@
 name: Create Neon Twin
-
 on:
   schedule:
     - cron: '0 0 * * *' # Runs every day at midnight
   workflow_dispatch: # Allows manual trigger
-  push:
-    branches:
-      - main
 
 permissions:
   id-token: write
@@ -32,6 +28,20 @@ jobs:
 
       - name: Verify AWS Identity
         run: aws sts get-caller-identity
+        
+      - name: Get EC2 Instance ID
+        run: |
+          EC2_INSTANCE_ID=$(aws ec2 describe-instances \
+            --filters "Name=tag:Name,Values=VSCodeServer" "Name=instance-state-name,Values=running" \
+            --query "Reservations[0].Instances[0].InstanceId" \
+            --output text)
+          echo "EC2_INSTANCE_ID=$EC2_INSTANCE_ID" >> $GITHUB_ENV
+
+      - name: Install Session Manager Plugin
+        run: |
+          curl "https://s3.amazonaws.com/session-manager-downloads/plugin/latest/ubuntu_64bit/session-manager-plugin.deb" -o "session-manager-plugin.deb"
+          sudo dpkg -i session-manager-plugin.deb
+          rm session-manager-plugin.deb
 
       - name: Install PostgreSQL Client
         run: |
@@ -44,33 +54,35 @@ jobs:
           pg_dump --version
           pg_restore --version
 
-      - name: Debug Connection String
-        env:
-          PROD_DATABASE_URL: ${{ secrets.PROD_DATABASE_URL }}
+      - name: Start Port Forwarding
         run: |
-          echo "Connection string: ${PROD_DATABASE_URL}" | sed 's/:.*@/:***@/'
-
-      - name: Test RDS Connection
-        env:
-          PROD_DATABASE_URL: ${{ secrets.PROD_DATABASE_URL }}
-        run: |
-          psql "${PROD_DATABASE_URL}" -c '\l'
+          # Extract host from PROD_DATABASE_URL
+          RDS_HOST=$(echo $PROD_DATABASE_URL | sed -n 's/.*@\([^:]*\).*/\1/p')
+          # Start SSM session and port forwarding in the background
+          nohup aws ssm start-session \
+            --target ${{ env.EC2_INSTANCE_ID }} \
+            --document-name AWS-StartPortForwardingSessionToRemoteHost \
+            --parameters "{\"host\":[\"$RDS_HOST\"],\"portNumber\":[\"5432\"], \"localPortNumber\":[\"15432\"]}" &
+          # Wait for port forwarding to be established
+          sleep 10
 
       - name: Dump from RDS
-        env:
-          PROD_DATABASE_URL: ${{ secrets.PROD_DATABASE_URL }}
         run: |
           echo "Dumping data from RDS to file..."
-          pg_dump "${PROD_DATABASE_URL}" -Fc -f "${{ github.workspace }}/prod-dump-file.dump"
+          /usr/lib/postgresql/${{ env.PG_VERSION }}/bin/pg_dump \
+            -d "${PROD_DATABASE_URL//@*:/@localhost:15432/}" \
+            -Fc -f "${{ github.workspace }}/prod-dump-file.dump"
 
       - name: Restore to Neon
         env:
           DEV_DATABASE_URL: ${{ secrets.DEV_DATABASE_URL }}
         run: |
           echo "Restoring data to Neon..."
-          pg_restore -d "${DEV_DATABASE_URL}" --clean --no-owner --no-acl --if-exists "${{ github.workspace }}/prod-dump-file.dump"
+          /usr/lib/postgresql/${{ env.PG_VERSION }}/bin/pg_restore -d "${DEV_DATABASE_URL}" --clean --no-owner --no-acl --if-exists "${{ github.workspace }}/prod-dump-file.dump"
 
       - name: Cleanup
         run: |
           echo "Cleaning up dump file..."
           rm -f "${{ github.workspace }}/prod-dump-file.dump"
+          # Kill the port forwarding session
+          pkill -f "ssm start-session"

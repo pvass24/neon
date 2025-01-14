@@ -73,8 +73,15 @@ jobs:
             --document-name AWS-StartPortForwardingSessionToRemoteHost \
             --parameters "{\"host\":[\"$DB_HOST\"],\"portNumber\":[\"5432\"], \"localPortNumber\":[\"15432\"]}" &
           
-          # Wait for port forwarding to be established
-          sleep 10
+          # Wait for port forwarding to be established and test the connection
+          for i in {1..30}; do
+            if nc -zv localhost 15432 >/dev/null 2>&1; then
+              echo "Port forwarding established"
+              break
+            fi
+            echo "Waiting for port forwarding... ($i/30)"
+            sleep 2
+          done
 
       - name: Dump from RDS
         run: |

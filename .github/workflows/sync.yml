@@ -12,6 +12,8 @@ env:
   PG_VERSION: '16'
   INSTANCE_TYPE: 't3.nano'
   LOCAL_PORT: '15432'
+  IAM_ROLE_NAME: 'TempEC2SSMRole'
+  IAM_PROFILE_NAME: 'TempEC2SSMProfile'
 
 jobs:
   sync-db:
@@ -22,6 +24,45 @@ jobs:
         with:
           role-to-assume: ${{ secrets.AWS_ACCOUNT_ROLE }}
           aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Setup IAM Role and Profile
+        id: iam_setup
+        run: |
+          # Create the IAM role
+          aws iam create-role \
+            --role-name "${{ env.IAM_ROLE_NAME }}-${GITHUB_RUN_ID}" \
+            --assume-role-policy-document '{
+              "Version": "2012-10-17",
+              "Statement": [{
+                "Effect": "Allow",
+                "Principal": {
+                  "Service": "ec2.amazonaws.com"
+                },
+                "Action": "sts:AssumeRole"
+              }]
+            }' || true
+          
+          # Attach SSM policy
+          aws iam attach-role-policy \
+            --role-name "${{ env.IAM_ROLE_NAME }}-${GITHUB_RUN_ID}" \
+            --policy-arn arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+          
+          # Create instance profile
+          aws iam create-instance-profile \
+            --instance-profile-name "${{ env.IAM_PROFILE_NAME }}-${GITHUB_RUN_ID}" || true
+          
+          # Add role to instance profile
+          aws iam add-role-to-instance-profile \
+            --instance-profile-name "${{ env.IAM_PROFILE_NAME }}-${GITHUB_RUN_ID}" \
+            --role-name "${{ env.IAM_ROLE_NAME }}-${GITHUB_RUN_ID}"
+          
+          # Store names for cleanup
+          echo "ROLE_NAME=${{ env.IAM_ROLE_NAME }}-${GITHUB_RUN_ID}" >> $GITHUB_ENV
+          echo "PROFILE_NAME=${{ env.IAM_PROFILE_NAME }}-${GITHUB_RUN_ID}" >> $GITHUB_ENV
+          
+          # Wait for instance profile to propagate
+          echo "Waiting for instance profile to propagate..."
+          sleep 10
 
       - name: Get VPC and Subnet Info
         id: vpc_info
@@ -56,14 +97,14 @@ jobs:
             --instance-type "${{ env.INSTANCE_TYPE }}" \
             --subnet-id "${{ env.SUBNET_ID }}" \
             --security-group-ids "$BASTION_SG" \
-            --iam-instance-profile Name=EC2SSMInstanceProfile \
+            --iam-instance-profile Name="${{ env.PROFILE_NAME }}" \
             --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=temp-bastion-${GITHUB_RUN_ID}}]" \
             --query 'Instances[0].InstanceId' \
             --output text)
           
           echo "INSTANCE_ID=$INSTANCE_ID" >> $GITHUB_ENV
           
-          # Wait for instance to be running and status checks to pass
+          # Wait for instance to be ready
           aws ec2 wait instance-running --instance-ids "$INSTANCE_ID"
           aws ec2 wait instance-status-ok --instance-ids "$INSTANCE_ID"
           
@@ -134,13 +175,35 @@ jobs:
           pkill -f "ssm start-session" || true
           
           # Terminate EC2 instance
-          aws ec2 terminate-instances --instance-ids "${{ env.INSTANCE_ID }}"
+          aws ec2 terminate-instances --instance-ids "${{ env.INSTANCE_ID }}" || true
+          aws ec2 wait instance-terminated --instance-ids "${{ env.INSTANCE_ID }}" || true
           
-          # Wait for instance termination
-          aws ec2 wait instance-terminated --instance-ids "${{ env.INSTANCE_ID }}"
+          # Delete security group (with retry for eventual consistency)
+          for i in {1..6}; do
+            if aws ec2 delete-security-group --group-id "${{ env.BASTION_SG }}" 2>/dev/null; then
+              break
+            fi
+            echo "Attempt $i: Waiting for security group to be deletable..."
+            sleep 10
+          done
           
-          # Delete security group
-          aws ec2 delete-security-group --group-id "${{ env.BASTION_SG }}"
+          # Remove role from instance profile
+          aws iam remove-role-from-instance-profile \
+            --instance-profile-name "${{ env.PROFILE_NAME }}" \
+            --role-name "${{ env.ROLE_NAME }}" || true
+          
+          # Delete instance profile
+          aws iam delete-instance-profile \
+            --instance-profile-name "${{ env.PROFILE_NAME }}" || true
+          
+          # Detach role policy
+          aws iam detach-role-policy \
+            --role-name "${{ env.ROLE_NAME }}" \
+            --policy-arn arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore || true
+          
+          # Delete role
+          aws iam delete-role \
+            --role-name "${{ env.ROLE_NAME }}" || true
           
           # Remove dump file
           rm -f dump.dump

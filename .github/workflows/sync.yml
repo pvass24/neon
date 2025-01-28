@@ -10,6 +10,7 @@ permissions:
 
 env:
   PG_VERSION: '16'
+  LOCAL_PORT: '15432'
 
 jobs:
   sync-db:
@@ -21,7 +22,7 @@ jobs:
           role-to-assume: ${{ secrets.AWS_ACCOUNT_ROLE }}
           aws-region: ${{ secrets.AWS_REGION }}
 
-      - name: Get RDS Security Group
+      - name: Get RDS Info
         id: rds_info
         run: |
           # Get RDS endpoint from SSM to identify instance
@@ -40,11 +41,9 @@ jobs:
       - name: Add Runner IP to Security Group
         id: ip_setup
         run: |
-          # Get runner's IP
           RUNNER_IP=$(curl -s ifconfig.me)
           echo "RUNNER_IP=$RUNNER_IP" >> $GITHUB_ENV
           
-          # Add to security group
           aws ec2 authorize-security-group-ingress \
             --group-id "${{ env.SECURITY_GROUP_ID }}" \
             --protocol tcp \
@@ -53,25 +52,26 @@ jobs:
           
           echo "Added IP ${RUNNER_IP} to security group"
 
-      - name: Install PostgreSQL
+      - name: Install Required Tools
         run: |
-          # Create the file repository configuration
-          sudo sh -c 'echo "deb http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
+          # Install SSM plugin
+          curl "https://s3.amazonaws.com/session-manager-downloads/plugin/latest/ubuntu_64bit/session-manager-plugin.deb" -o "session-manager-plugin.deb"
+          sudo dpkg -i session-manager-plugin.deb
+          rm session-manager-plugin.deb
           
-          # Import the repository signing key
-          wget --quiet -O - https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo apt-key add -
-          
-          # Update package lists
+          # Install netcat
           sudo apt-get update
+          sudo apt-get install -y netcat
           
           # Install PostgreSQL client
+          sudo sh -c 'echo "deb http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
+          wget --quiet -O - https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo apt-key add -
+          sudo apt-get update
           sudo apt-get install -y postgresql-client-${{ env.PG_VERSION }}
-          
-          # Verify installation
-          pg_dump --version
 
-      - name: Get Database Credentials
+      - name: Start Port Forwarding
         run: |
+          # Get RDS details from SSM
           DB_HOST=$(aws ssm get-parameter --name '/rds/db-endpoint' --query 'Parameter.Value' --output text)
           DB_USER=$(aws ssm get-parameter --name '/rds/db-username' --query 'Parameter.Value' --output text)
           DB_PASS=$(aws ssm get-parameter --name '/rds/db-password' --with-decryption --query 'Parameter.Value' --output text)
@@ -79,12 +79,41 @@ jobs:
           echo "DB_HOST=$DB_HOST" >> $GITHUB_ENV
           echo "DB_USER=$DB_USER" >> $GITHUB_ENV
           echo "DB_PASS=$DB_PASS" >> $GITHUB_ENV
+          
+          # Start SSM session with port forwarding
+          aws ssm start-session \
+            --target ${{ env.EC2_INSTANCE_ID }} \
+            --document-name AWS-StartPortForwardingSessionToRemoteHost \
+            --parameters "{\"host\":[\"$DB_HOST\"],\"portNumber\":[\"5432\"], \"localPortNumber\":[\"${{ env.LOCAL_PORT }}\"]}" > ssm_output.log 2>&1 &
+          
+          # Wait for port forwarding to establish
+          echo "Waiting for port forwarding to be established..."
+          attempt=1
+          max_attempts=30
+          
+          until nc -z localhost ${{ env.LOCAL_PORT }} || [ $attempt -gt $max_attempts ]
+          do
+            echo "Attempt $attempt of $max_attempts"
+            cat ssm_output.log
+            sleep 5
+            attempt=$((attempt + 1))
+          done
+          
+          if [ $attempt -gt $max_attempts ]; then
+            echo "Failed to establish port forwarding"
+            cat ssm_output.log
+            exit 1
+          fi
+          
+          echo "Port forwarding successfully established"
+          ps aux | grep ssm
 
       - name: Dump RDS Database
         run: |
           echo "Starting database dump..."
           PGPASSWORD="${{ env.DB_PASS }}" pg_dump \
-            -h "${{ env.DB_HOST }}" \
+            -h localhost \
+            -p ${{ env.LOCAL_PORT }} \
             -U "${{ env.DB_USER }}" \
             -d employees \
             -Fc -f dump.dump
@@ -101,21 +130,18 @@ jobs:
           
           echo "Restore to Neon completed"
 
-      - name: Remove Runner IP
-        if: always()  # Run even if previous steps fail
+      - name: Cleanup
+        if: always()
         run: |
-          echo "Removing IP ${RUNNER_IP} from security group..."
+          echo "Cleaning up..."
+          pkill -f "ssm start-session" || true
+          
+          # Remove IP from security group
           aws ec2 revoke-security-group-ingress \
             --group-id "${{ env.SECURITY_GROUP_ID }}" \
             --protocol tcp \
             --port 5432 \
             --cidr ${RUNNER_IP}/32
           
-          echo "Removed IP from security group"
-
-      - name: Cleanup
-        if: always()
-        run: |
-          echo "Cleaning up temporary files..."
           rm -f dump.dump
           echo "Cleanup completed"

@@ -10,6 +10,8 @@ permissions:
 
 env:
   PG_VERSION: '16'
+  INSTANCE_TYPE: 't3.nano'
+  LOCAL_PORT: '15432'
 
 jobs:
   sync-db:
@@ -21,83 +23,97 @@ jobs:
           role-to-assume: ${{ secrets.AWS_ACCOUNT_ROLE }}
           aws-region: ${{ secrets.AWS_REGION }}
 
-      - name: Get RDS Info
-        id: rds_info
+      - name: Get VPC and Subnet Info
+        id: vpc_info
         run: |
-          # Get RDS endpoint from SSM to identify instance
+          # Get RDS instance info
           DB_IDENTIFIER=$(aws ssm get-parameter --name '/rds/db-endpoint' --query 'Parameter.Value' --output text | cut -d'.' -f1)
-          echo "DB identifier: $DB_IDENTIFIER"
           
-          # Get security group ID from RDS instance
-          SG_ID=$(aws rds describe-db-instances \
-            --db-instance-identifier "$DB_IDENTIFIER" \
-            --query 'DBInstances[0].VpcSecurityGroups[0].VpcSecurityGroupId' \
+          # Get VPC and subnet info from RDS instance
+          RDS_INFO=$(aws rds describe-db-instances --db-instance-identifier "$DB_IDENTIFIER" --query 'DBInstances[0]')
+          VPC_ID=$(echo $RDS_INFO | jq -r '.DBSubnetGroup.VpcId')
+          SUBNET_ID=$(echo $RDS_INFO | jq -r '.DBSubnetGroup.Subnets[0].SubnetId')
+          
+          echo "VPC_ID=$VPC_ID" >> $GITHUB_ENV
+          echo "SUBNET_ID=$SUBNET_ID" >> $GITHUB_ENV
+          echo "DB_IDENTIFIER=$DB_IDENTIFIER" >> $GITHUB_ENV
+
+      - name: Create Temporary Bastion
+        id: create_bastion
+        run: |
+          # Create security group for bastion
+          BASTION_SG=$(aws ec2 create-security-group \
+            --group-name "temp-bastion-${GITHUB_RUN_ID}" \
+            --description "Temporary bastion host for database sync" \
+            --vpc-id "${{ env.VPC_ID }}" \
+            --query 'GroupId' --output text)
+          
+          echo "BASTION_SG=$BASTION_SG" >> $GITHUB_ENV
+          
+          # Allow inbound SSH from GitHub runner
+          RUNNER_IP=$(curl -s ifconfig.me)
+          aws ec2 authorize-security-group-ingress \
+            --group-id "$BASTION_SG" \
+            --protocol tcp \
+            --port 22 \
+            --cidr "${RUNNER_IP}/32"
+          
+          # Create EC2 instance
+          INSTANCE_ID=$(aws ec2 run-instances \
+            --image-id resolve:ssm:/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2 \
+            --instance-type "${{ env.INSTANCE_TYPE }}" \
+            --subnet-id "${{ env.SUBNET_ID }}" \
+            --security-group-ids "$BASTION_SG" \
+            --iam-instance-profile Name="SSMInstanceProfile" \
+            --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=temp-bastion-${GITHUB_RUN_ID}}]" \
+            --query 'Instances[0].InstanceId' \
             --output text)
           
-          echo "Found Security Group ID: $SG_ID"
-          echo "SECURITY_GROUP_ID=$SG_ID" >> $GITHUB_ENV
+          echo "INSTANCE_ID=$INSTANCE_ID" >> $GITHUB_ENV
+          
+          # Wait for instance to be running and status checks to pass
+          aws ec2 wait instance-running --instance-ids "$INSTANCE_ID"
+          aws ec2 wait instance-status-ok --instance-ids "$INSTANCE_ID"
 
       - name: Install Required Tools
         run: |
+          # Install SSM plugin
+          curl "https://s3.amazonaws.com/session-manager-downloads/plugin/latest/ubuntu_64bit/session-manager-plugin.deb" -o "session-manager-plugin.deb"
+          sudo dpkg -i session-manager-plugin.deb
+          rm session-manager-plugin.deb
+          
           # Install PostgreSQL client
           sudo sh -c 'echo "deb http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
           wget --quiet -O - https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo apt-key add -
           sudo apt-get update
-          sudo apt-get install -y postgresql-client-${{ env.PG_VERSION }} netcat-openbsd
+          sudo apt-get install -y postgresql-client-${{ env.PG_VERSION }}
 
-      - name: Add Runner IP and Test Connection
-        id: ip_setup
+      - name: Setup Port Forwarding
         run: |
-          # Get runner's IP
-          RUNNER_IP=$(curl -s ifconfig.me)
-          echo "RUNNER_IP=$RUNNER_IP" >> $GITHUB_ENV
-          
-          # Add to security group
-          aws ec2 authorize-security-group-ingress \
-            --group-id "${{ env.SECURITY_GROUP_ID }}" \
-            --protocol tcp \
-            --port 5432 \
-            --cidr "${RUNNER_IP}/32"
-          
-          echo "Added IP ${RUNNER_IP} to security group"
-          
-          # Get RDS endpoint
+          # Get database details
           DB_HOST=$(aws ssm get-parameter --name '/rds/db-endpoint' --query 'Parameter.Value' --output text)
-          echo "DB_HOST=$DB_HOST" >> $GITHUB_ENV
-          
-          # Wait for security group changes to propagate and test connection
-          echo "Waiting for security group changes to propagate..."
-          for i in {1..10}; do
-            if nc -zv "$DB_HOST" 5432 2>/dev/null; then
-              echo "Connection successful!"
-              break
-            fi
-            echo "Attempt $i: Waiting for connection..."
-            sleep 10
-          done
-
-      - name: Get Database Credentials
-        run: |
           DB_USER=$(aws ssm get-parameter --name '/rds/db-username' --query 'Parameter.Value' --output text)
           DB_PASS=$(aws ssm get-parameter --name '/rds/db-password' --with-decryption --query 'Parameter.Value' --output text)
           
+          echo "DB_HOST=$DB_HOST" >> $GITHUB_ENV
           echo "DB_USER=$DB_USER" >> $GITHUB_ENV
           echo "DB_PASS=$DB_PASS" >> $GITHUB_ENV
-
-      - name: Test Database Connection
-        run: |
-          echo "Testing database connection..."
-          PGPASSWORD="${{ env.DB_PASS }}" psql \
-            -h "${{ env.DB_HOST }}" \
-            -U "${{ env.DB_USER }}" \
-            -d employees \
-            -c "SELECT 1" || exit 1
+          
+          # Start port forwarding through bastion
+          aws ssm start-session \
+            --target "${{ env.INSTANCE_ID }}" \
+            --document-name AWS-StartPortForwardingSessionToRemoteHost \
+            --parameters "{\"host\":[\"$DB_HOST\"],\"portNumber\":[\"5432\"],\"localPortNumber\":[\"${{ env.LOCAL_PORT }}\"]}" &
+          
+          # Wait for port forwarding to establish
+          sleep 10
 
       - name: Dump RDS Database
         run: |
           echo "Starting database dump..."
           PGPASSWORD="${{ env.DB_PASS }}" pg_dump \
-            -h "${{ env.DB_HOST }}" \
+            -h localhost \
+            -p ${{ env.LOCAL_PORT }} \
             -U "${{ env.DB_USER }}" \
             -d employees \
             -Fc -f dump.dump
@@ -114,20 +130,24 @@ jobs:
           
           echo "Restore to Neon completed"
 
-      - name: Remove Runner IP
-        if: always()
-        run: |
-          echo "Removing IP ${RUNNER_IP} from security group..."
-          aws ec2 revoke-security-group-ingress \
-            --group-id "${{ env.SECURITY_GROUP_ID }}" \
-            --protocol tcp \
-            --port 5432 \
-            --cidr ${RUNNER_IP}/32
-          
-          echo "Removed IP from security group"
-
       - name: Cleanup
         if: always()
         run: |
+          echo "Cleaning up resources..."
+          
+          # Kill port forwarding
+          pkill -f "ssm start-session" || true
+          
+          # Terminate EC2 instance
+          aws ec2 terminate-instances --instance-ids "${{ env.INSTANCE_ID }}"
+          
+          # Wait for instance termination
+          aws ec2 wait instance-terminated --instance-ids "${{ env.INSTANCE_ID }}"
+          
+          # Delete security group
+          aws ec2 delete-security-group --group-id "${{ env.BASTION_SG }}"
+          
+          # Remove dump file
           rm -f dump.dump
+          
           echo "Cleanup completed"

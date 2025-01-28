@@ -21,6 +21,22 @@ jobs:
           role-to-assume: ${{ secrets.AWS_ACCOUNT_ROLE }}
           aws-region: ${{ secrets.AWS_REGION }}
 
+      - name: Get RDS Security Group
+        id: rds_info
+        run: |
+          # Get RDS endpoint from SSM to identify instance
+          DB_IDENTIFIER=$(aws ssm get-parameter --name '/rds/db-endpoint' --query 'Parameter.Value' --output text | cut -d'.' -f1)
+          echo "DB identifier: $DB_IDENTIFIER"
+          
+          # Get security group ID from RDS instance
+          SG_ID=$(aws rds describe-db-instances \
+            --db-instance-identifier "$DB_IDENTIFIER" \
+            --query 'DBInstances[0].VpcSecurityGroups[0].VpcSecurityGroupId' \
+            --output text)
+          
+          echo "Found Security Group ID: $SG_ID"
+          echo "SECURITY_GROUP_ID=$SG_ID" >> $GITHUB_ENV
+
       - name: Add Runner IP to Security Group
         id: ip_setup
         run: |
@@ -30,10 +46,10 @@ jobs:
           
           # Add to security group with description
           aws ec2 authorize-security-group-ingress \
-            --group-id ${{ secrets.RDS_SECURITY_GROUP_ID }} \
+            --group-id "${{ env.SECURITY_GROUP_ID }}" \
             --protocol tcp \
             --port 5432 \
-            --cidr ${RUNNER_IP}/32 \
+            --cidr "${RUNNER_IP}/32" \
             --description "GitHub Actions Runner - $(date +%Y%m%d-%H%M%S)"
           
           echo "Added IP ${RUNNER_IP} to security group"
@@ -79,7 +95,7 @@ jobs:
         run: |
           echo "Removing IP ${RUNNER_IP} from security group..."
           aws ec2 revoke-security-group-ingress \
-            --group-id ${{ secrets.RDS_SECURITY_GROUP_ID }} \
+            --group-id "${{ env.SECURITY_GROUP_ID }}" \
             --protocol tcp \
             --port 5432 \
             --cidr ${RUNNER_IP}/32

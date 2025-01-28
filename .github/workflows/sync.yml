@@ -50,21 +50,13 @@ jobs:
           
           echo "BASTION_SG=$BASTION_SG" >> $GITHUB_ENV
           
-          # Allow inbound SSH from GitHub runner
-          RUNNER_IP=$(curl -s ifconfig.me)
-          aws ec2 authorize-security-group-ingress \
-            --group-id "$BASTION_SG" \
-            --protocol tcp \
-            --port 22 \
-            --cidr "${RUNNER_IP}/32"
-          
           # Create EC2 instance
           INSTANCE_ID=$(aws ec2 run-instances \
             --image-id resolve:ssm:/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2 \
             --instance-type "${{ env.INSTANCE_TYPE }}" \
             --subnet-id "${{ env.SUBNET_ID }}" \
             --security-group-ids "$BASTION_SG" \
-            --iam-instance-profile Name="SSMInstanceProfile" \
+            --iam-instance-profile Name=EC2SSMInstanceProfile \
             --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=temp-bastion-${GITHUB_RUN_ID}}]" \
             --query 'Instances[0].InstanceId' \
             --output text)
@@ -74,6 +66,8 @@ jobs:
           # Wait for instance to be running and status checks to pass
           aws ec2 wait instance-running --instance-ids "$INSTANCE_ID"
           aws ec2 wait instance-status-ok --instance-ids "$INSTANCE_ID"
+          
+          echo "Bastion instance $INSTANCE_ID is ready"
 
       - name: Install Required Tools
         run: |
@@ -106,7 +100,8 @@ jobs:
             --parameters "{\"host\":[\"$DB_HOST\"],\"portNumber\":[\"5432\"],\"localPortNumber\":[\"${{ env.LOCAL_PORT }}\"]}" &
           
           # Wait for port forwarding to establish
-          sleep 10
+          echo "Waiting for port forwarding to establish..."
+          sleep 15
 
       - name: Dump RDS Database
         run: |
